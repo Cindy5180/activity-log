@@ -1,0 +1,199 @@
+name: Build-Test-Release
+
+on:
+  push:
+    branches: [master, assignment-5]
+  workflow_dispatch:
+    inputs:
+      test_env:
+        description: "Value for TEST_ENV used by the test jobs"
+        type: choice
+        options: [staging, prod]
+        default: staging
+      force_fail:
+        description: "Make the unit tests fail on purpose (demo of the test gate)"
+        type: boolean
+        default: false
+
+env:
+  TEST_ENV: ${{ inputs.test_env || 'staging' }}
+  FORCE_TEST_FAIL: ${{ inputs.force_fail && 'true' || 'false' }}
+
+jobs:
+  # ---------------------------------------------------------------- build
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Build
+        run: bun run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+
+  # ---------------------------------------------------------- test: unit
+  # Matrix: the unit tests must pass on both Node 20 and Node 22.
+  test-unit:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+      - name: Run unit tests (TEST_ENV=${{ env.TEST_ENV }}, Node ${{ matrix.node-version }})
+        run: npm run test:unit
+
+  # --------------------------------------------------- test: integration
+  test-integration:
+    needs: test-unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+      - name: Run integration tests (TEST_ENV=${{ env.TEST_ENV }})
+        run: npm run test:integration
+
+  # ------------------------------------------------------ test: coverage
+  # Fails (and therefore blocks every release) when line coverage < 80 %.
+  coverage:
+    needs: test-integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+      - name: Run tests with coverage gate (>= 80 % lines)
+        run: |
+          mkdir -p reports
+          npm run test:coverage | tee reports/coverage.txt
+      - name: Add coverage to the job summary
+        if: always()
+        run: |
+          {
+            echo "### Test coverage"
+            echo '```'
+            sed -n '/start of coverage report/,/end of coverage report/p' reports/coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload coverage and JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: reports/
+
+  # -------------------------------------------- notify: issue on failure
+  report-failure:
+    needs: [test-unit, test-integration, coverage]
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open a GitHub issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create \
+            --title "CI failed on ${{ github.ref_name }} (run #${{ github.run_number }})" \
+            --body "The Build-Test-Release workflow failed before the release stage, so nothing was released.
+
+          - Commit: ${{ github.sha }}
+          - TEST_ENV: ${{ env.TEST_ENV }}
+          - Run: $RUN_URL"
+
+  # ---------------------------------------------------------------- dev
+  release-dev:
+    needs: [test-unit, test-integration, coverage]
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+      - name: Release to dev
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          echo "✅ All tests passed. Releasing dev build..."
+          zip -r build.zip dist
+          gh release create "dev-${{ github.run_number }}" build.zip \
+            --target "${{ github.sha }}" \
+            --title "dev-${{ github.run_number }}" \
+            --notes "Automated release after successful tests"
+
+  # ------------------------------------------------------------ staging
+  deploy-staging:
+    needs: release-dev
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+      - name: Release to staging
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          zip -r build.zip dist
+          gh release create "staging-${{ github.run_number }}" build.zip \
+            --target "${{ github.sha }}" \
+            --title "staging-${{ github.run_number }}" \
+            --notes "Staging release"
+
+  # --------------------------------------------------------- production
+  # The `production` environment needs required reviewers (repo Settings →
+  # Environments); the job pauses here until someone approves it.
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+      - name: Release to production
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          zip -r build.zip dist
+          gh release create "prod-${{ github.run_number }}" build.zip \
+            --target "${{ github.sha }}" \
+            --title "prod-${{ github.run_number }}" \
+            --notes "Production release"
